@@ -1,0 +1,258 @@
+
+close all;
+warning off
+%%
+%%%%%%%%%%%%%%%%%%%%%%%Endogenous Variables %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+var
+c             % consumption 
+rk            % rental rate of capital 
+rr            % real interest rate
+w             % real wage
+h             % hours 
+k             % capital
+q             % Tobin Q
+i             % investment
+lambda        % marginal utility of consumption
+r             % nominal interest rate
+pi            % inflation 
+mc            % marginal cost
+g             % public spending
+a             % TFP
+piH           % PPI inflation
+s             % real exchange rate
+pH            % relative PPI
+yH            % domestic production
+d             % external debt
+gdp           % gross domestic product
+De            % nominal depreciation
+yz            % foreign demand
+rz            % foreign interest rate
+tb            % trade balance
+xp            % exports
+mp            % imports
+tot           % terms of trade
+tariff        % spain imposes a tariff
+tariff2       % spain faces a tariff
+W Wlog u_inst
+
+% log variables to have IRFs in percentage deviations from the ss
+clog wlog hlog klog ilog dlog
+     
+proof         % check variables
+tariff_revenue
+;
+
+
+
+%%
+%%%%%%%%%%%%%%%%%%%%%%%Exogenous Variables%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+varexo 
+va      % productivity shock
+vg      % public spending shock
+vm      % monetary policy shock
+vy      % foreign demand shock
+vp      % foreign monetary policy shock
+vtariff % imposed tariff shock
+vt2     % recieved tariff shock
+;  
+    
+%%
+%%%%%%%%%%%%%%%%%%%%%%%Parameters%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+parameters
+
+beta 
+alpha 
+delta 
+sigma
+phi 
+kappaL 
+epsilon 
+eta 
+gamma 
+gammaz
+gss 
+ass 
+piss 
+rss 
+dss 
+kappaI
+kappaP
+kappaD
+phipi
+phiy
+phie
+rhoa
+rhog
+rhom
+rhop
+rhoy
+rhotariff    
+tariffss
+rhotariff2
+tariff2ss  
+theta_retaliation
+theta_tariff
+;
+
+load par;  % load mat file created in console
+for jj=1:length(M_.param_names)
+set_param_value(M_.param_names{jj},eval(M_.param_names{jj})); 
+end; 
+
+
+
+%%
+%%%%%%%%%%%%%%%%%%%%%%%Non-Linear Model%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+model;
+% Households
+lambda=(c-kappaL/(1+phi)*h^(1+phi))^-sigma;  
+1=beta*lambda(1)/lambda*r/pi(1);
+1 = beta * lambda(1)/lambda * rz * (s(1)) / (s) + kappaD * (d - dss);
+1=beta*lambda(1)/lambda*(rk(1)+(1-delta)*q(1))/q;
+kappaL*h^(phi)=w;        
+k=(1-delta)*k(-1)+(1-kappaI/2*(i/i(-1)-1)^2)*i;
+1=q*(1-kappaI/2*(i/i(-1)-1)^2-kappaI*(i/i(-1)-1)*i/i(-1))+kappaI*beta*lambda(1)/lambda*q(1)*(i(1)/i-1)*(i(1)/i)^2;    
+
+
+% Firms
+
+yH=a*k(-1)^alpha*h^(1-alpha);
+(1-alpha)*mc*yH=w*h;
+alpha*mc*yH=rk*k(-1);
+(piH-piss)*piH=beta*(lambda(1)/lambda*pH(1)*yH(1)/(pH*yH)*piH(1)*(piH(1)-piss))+epsilon/kappaP*(mc/pH-(epsilon-1)/epsilon);
+
+
+% Market clearing
+yH=(1-gamma)*pH^(-eta)*(c+i)+g+gammaz*yz*(tot)^eta+(kappaP/2*(piH-piss)^2)*yH;
+gdp = c + i + pH * g
+     - s * d
+     + s * rz(-1) * d(-1)
+     + (kappaP / 2 * (piH - piss)^2) * gdp
+     + s * kappaD / 2 * (d - dss)^2;
+
+% Prices
+1 = (1 - gamma) * pH^(1 - eta) + gamma * (s*(1+tariff))^(1 - eta);
+piH=pH/pH(-1)*pi;
+
+
+% Policy
+r/(rss)=((pi/piss)^(phipi)*(gdp)^(phiy)*(De/piss)^phie)^(1-rhom)*(r(-1)/rss)^(rhom)*exp(vm);
+%r/(rss)=((pi/piss)^phipi*(gdp)^phiy*(De/piss)^phie*exp(phitariff * tariff))^(1-rhom)*(r(-1)/rss)^(rhom)*exp(vm);
+% Shocks
+log(tariff) = (1-rhotariff) * log(tariffss) + rhotariff*log(tariff(-1)) + vtariff;
+%log(tariff) = (1 - rhotariff) * log(tariffss) + rhotariff * log(tariff(-1)) + theta_retaliation * (log(tariff2(-1)) - log(tariff(-1))) + vtariff;
+      
+log(tariff2) = (1-rhotariff2) * log(tariff2ss) + rhotariff2*log(tariff2(-1)) + vt2;
+%tariff = rhotariff * tariff(-1) + vtariff;
+%tariff2 = rhotariff2 * tariff2(-1) + vt2;
+
+log(a)=(1-rhoa)*log(ass)+rhoa*log(a(-1))+va;
+log(g) = (1 - rhog)*log(gss) + rhog*log(g(-1)) + theta_tariff * tariff + vg;
+%log(g)=(1-rhog)*log(gss)+rhog*log(g(-1))+vg;
+log(yz)=rhoy*log(yz(-1))+vy; 
+rz=(1-rhop)*1/beta+rhop*rz(-1)+vp;
+
+
+% Auxiliary variables
+rr=r/pi(1);
+(s) / (s(-1)) = De/pi;
+gdp=pH*yH;
+tb=xp-mp;
+xp=pH*gammaz*(1-tariff2)*yz*(tot)^eta;
+mp=gamma*(s)^(1-eta)*(c+i);
+tot=(s*(1+tariff))/(pH*((1+tariff2)));
+clog=log(c); wlog=log(w); hlog=log(h); klog=log(k); ilog=log(i); dlog=log((s)*d/(4*gdp));
+proof=gdp-(c+i+pH*g+tb+(kappaP/2*(piH-piss)^2)*gdp);
+u_inst = lambda^(-1/sigma);
+W = u_inst + beta * W(+1);
+Wlog = log(W);
+tariff_revenue = tariff * mp;
+
+end;
+
+%% Steady State
+
+steady_state_model;
+tariff = tariffss;
+tariff2 = tariff2ss;
+pi=1;  
+piH=1;
+d=dss;                       
+yH=1;
+s=1;                           
+pH = 1;                                          
+h=1/3;                       
+rr=1/beta;                   
+r=pi/beta;                   
+q=1;                         
+rk=1/beta-(1-delta);         
+mc=(epsilon-1)/epsilon;      
+k=alpha*mc*yH/rk;            
+w=(1-alpha)*mc*yH/h;        
+i=delta*k; 
+g=gss;
+c = yH - i - g - d * (1/beta - 1);
+lambda=(c-kappaL/(1+phi)*h^(1+phi))^(-sigma);   
+a=ass; 
+rz=1/beta;
+yz=1;
+De=1;
+gdp = c + i + pH * g + s * d * (1 / beta - 1);
+
+% === Tariff-adjusted definitions ===
+tot=(s*(1+tariffss))/(pH*(1+tariff2ss));
+xp=pH*(1-tariff2ss)*gammaz*yz*(tot)^eta;
+mp=gamma*(s*(1+tariffss))^(1-eta)*(c+i);
+tariff_revenue = tariff * mp;
+tb=xp-mp+s*(1+tariffss)*kappaD/2*(d-dss)^2;
+
+clog=log(c);
+wlog=log(w);
+hlog=log(h); 
+klog=log(k); 
+ilog=log(i); 
+dlog=log((s*(1+tariffss))*d/(4*gdp));
+u_inst = lambda^(-1/sigma);
+W = u_inst / (1 - beta);
+Wlog = log(W);
+proof=0;
+
+end;
+options_.solve_tolf = 1e-2;
+
+
+steady;
+check;
+
+%% Shocks
+shocks;
+%var va; stderr 0.01;     
+%var vg; stderr 0.01;    
+%var vm; stderr 0.0025; 
+%var vy; stderr 0.01;     
+%var vp; stderr 0.0025;
+var vtariff; stderr 2.48;
+%var vt2; stderr 3;   
+end;
+
+%% IRFs
+stoch_simul(irf=60,order=1, hp_filter=1600,pruning)
+tariff2
+tariff
+gdp 
+clog  
+klog
+hlog
+pi
+tb 
+%tot
+%hlog
+%dlog
+%wlog
+%r
+%mc
+Wlog
+;
+
