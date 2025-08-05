@@ -1,0 +1,300 @@
+
+close all;
+warning off
+%%
+%%%%%%%%%%%%%%%%%%%%%%%Endogenous Variables %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+var
+c             % consumption 
+rk            % rental rate of capital 
+rr            % real interest rate
+w             % real wage
+h             % hours
+y             % output
+k             % capital
+q             % Tobin Q
+i             % investment
+lambda        % marginal utility of consumption
+r             % nominal interest rate
+mc            % net marginal cost
+pi            % inflation 
+g             % public spending
+a             % exogenous TFP
+c_r           % rule-of-thumb household consumption
+c_o           % optimizing husehold consumption
+h_r           % rule-of-thumb households labor
+h_o           % optimizing households labor
+t_r           % rule-of thumb households taxes
+t_o           % optimizing households taxes
+d             % debt 
+piH           % PPI inflation
+s             % real exchange rate
+pH            % relative PPI
+De            % nominal depreciation
+yz            % foreign demand
+rz            % foreign interest rate
+tb            % trade balance
+xp            % exports
+mp            % imports
+tot           % terms of trade
+hindex        % heterogeneity index (Komatsu 2023) 
+proof         % accounting
+tariff
+tariffsp
+
+
+% log variables
+clog 
+wlog 
+hlog
+klog
+ilog  
+c_r_log
+c_o_log
+h_r_log
+h_o_log
+dlog 
+;
+
+%%%%%%%%%%%%%%%%%%%%%%%Exogenous Variables%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+varexo 
+va   % productivity shock
+vg   % public spending shock
+vm   % monetary policy shock
+vp   % foreign monetary policy shock
+vy   % foreign demand shock
+vtariff
+vtariffsp
+;  
+    
+
+%%%%%%%%%%%%%%%%%%%%%%%Parameters%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+parameters
+
+share  % share of h-t-m agents (arroyo tisnés 2024)
+beta 
+alpha
+delta
+sigma
+phi
+kappaL
+epsilon
+gss 
+ass
+piss
+rss
+tariffss
+kappaI
+kappaP
+kappaD
+phipi
+phiy
+phie
+rhoa
+rhog
+rhom
+rhoy
+rhop 
+phig
+phitariff
+phid 
+t_oss 
+t_rss 
+dss
+eta  
+gamma
+gammaz
+rhotariff
+theta_retaliation
+;
+
+load par;  % load mat file created in console
+for jj=1:length(M_.param_names)
+set_param_value(M_.param_names{jj},eval(M_.param_names{jj})); 
+end; 
+
+
+
+
+%%
+%%%%%%%%%%%%%%%%%%%%%%%Non-Linear Model%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+model;
+% Households 8
+
+%lambda= (c_o-kappaL/(1+phi)*h_o^(1+phi))^-sigma; 
+lambda= (c_o)^-sigma; 
+
+
+
+1=beta*lambda(1)/lambda*r/pi(1);
+1=beta*lambda(1)/lambda*rz*s(1)/s+kappaD*(d-dss);
+1=beta*lambda(1)/lambda*(rk(1)+(1-delta)*q(1))/q;
+
+kappaL*h_o^(phi)=w*lambda;        
+kappaL*h_r^(phi)=w*c_r^(-sigma);
+%kappaL*h_r^(phi)=w*lambda;
+
+
+
+k=(1-delta)*k(-1)+(1-kappaI/2*(i/i(-1)-1)^2)*i;
+1=q*(1-kappaI/2*(i/i(-1)-1)^2-kappaI*(i/i(-1)-1)*i/i(-1))+kappaI*beta*lambda(1)/lambda*q(1)*(i(1)/i-1)*(i(1)/i)^2;  
+  
+
+% Firms 4
+
+y=a*k(-1)^alpha*h^(1-alpha);
+(1-alpha)*mc*y=w*h;
+alpha*mc*y=rk*k(-1);
+(pi-steady_state(pi))*pi=beta*(lambda(1)/lambda*y(1)/y*pi(1)*(pi(1)-steady_state(pi)))+epsilon/kappaP*(mc-(epsilon-1)/epsilon);
+
+
+% Market clearing 4
+
+%y=(1-gamma)*pH^(-eta)*(c+i)+pH*g+gammaz*yz*(tot)^eta+(kappaP/2*(piH-piss)^2)*y;
+y=(1-gamma)*pH^(-eta)*(c+i)+g+gammaz*yz*(tot)^eta+(kappaP/2*(piH-piss)^2)*y;
+
+c=(1-share)*c_o+share*c_r;
+h=(1-share)*h_o+share*h_r;
+c_r=w*h_r-t_r;
+
+% Prices 2
+
+1=(1-gamma)*(pH*(1))^(1-eta)+gamma*s^(1-eta);
+piH=pH/pH(-1)*pi;
+
+% Policy 4
+%r/(rss)=((pi/steady_state(pi))^(phipi)*(y)^(phiy))^(1-rhom)*(r(-1)/rss)^(rhom)*exp(vm);
+
+
+r/(rss)=((pi/steady_state(pi))^(phipi)*(y)^(phiy)*(tariff/tariffss)^(phitariff))^(1-rhom)*(r(-1)/rss)^(rhom)*exp(vm);
+
+
+% t_r-steady_state(t_r)=phig*(g-gss)+phid*(d(-1)-dss);
+% t_o-steady_state(t_o)=phig*(g-gss)+phid*(d(-1)-dss);
+%(1 - share)*t_o + share*t_r = g + (1/beta - 1)*d;
+
+t_r-steady_state(t_r)=0;
+t_o-steady_state(t_o)=0;
+c=y-i-g-s*(d(-1)*rz(-1)-d);       
+
+
+% Shocks 4
+log(a)=(1-rhoa)*log(ass)+rhoa*log(a(-1))+va;  
+%log(g)=(1-rhog)*log(gss)+rhog*log(g(-1))+vg;  
+g=(1-rhog)*gss+rhog*g(-1)+vg;  
+log(yz)=rhoy*log(yz(-1))+vy; 
+rz=(1-rhop)*1/beta+rhop*rz(-1)+vp;
+
+log(tariff) = (1-rhotariff)*log(tariffss) + rhotariff*log(tariff(-1)) + vtariff;
+%log(tariffsp) = (1-rhotariff)*log(tariffss) + rhotariff*log(tariffsp(-1)) + vtariffsp;
+        %%retaliation
+log(tariffsp) = (1 - rhotariff) * log(tariffss) + rhotariff * log(tariffsp(-1)) + theta_retaliation * (log(tariff(-1)) - log(tariffsp(-1))) + vtariffsp;
+
+
+% Auxiliary variables 18
+
+rr=r/pi(1);
+s/s(-1)=De/pi;
+tb = xp - mp + s * kappaD / 2 * (d - dss)^2;
+%tb=xp-mp;
+xp=pH*gammaz*yz*(tot)^eta;
+mp=gamma*s^(1-eta)*(c+i);
+tot=(s*(1+tariffsp))/(pH*(1+tariff));
+hindex = c_o/c_r;
+clog=log(c); 
+wlog=log(w); 
+hlog=log(h); 
+klog=log(k); 
+ilog=log(i);
+c_r_log=log(c_r);
+c_o_log=log(c_o);
+h_r_log=log(h_r);
+h_o_log=log(h_o);
+dlog=log(s*d/(4*y));
+proof=y-(c+i+pH*g+tb+(kappaP/2*(piH-piss)^2)*y);
+
+end;
+
+%% Steady State
+
+steady_state_model;
+
+pi = 1;
+piH = 1;
+d = dss;                        
+y = 1;
+pH = 1;                        
+s = 1;                         
+h = 1/3; 
+rk = 1 / beta - (1 - delta);                      
+rr = 1 / beta;
+rz = 1 / beta;                   
+r = pi / beta;                   
+q = 1;                         
+mc = (epsilon - 1) / epsilon;      
+k = alpha * mc * y / rk;             
+w = (1 - alpha) * mc * y / h;          
+i = delta * k;
+g = gss;
+a = ass;
+
+h_o = h;
+h_r = h;
+
+% Taxes
+t_r = t_rss;
+t_o = t_oss;
+
+% Rule-of-thumb consumption
+c_r = w * h_r - t_r;
+
+% Total consumption
+%c = y - i - g;
+c=y-i-g-d*(1/beta-1);       
+c_o = (c - share * c_r) / (1 - share);
+%lambda = (c - kappaL / (1 + phi) * h^(1 + phi))^(-sigma);
+lambda = (c)^(-sigma);
+tariff = 0.01;
+tariffsp = 0.01;
+yz = 1;
+De = 1;
+tot = s / pH;
+xp = pH*(1-tariff)* (gammaz) * yz * (tot)^eta;
+mp = gamma * s^(1 - eta) * (c + i);
+tb = xp - mp + s * kappaD / 2 * (d - dss)^2;
+%tb = xp - mp;
+hindex = 1;
+clog = log(c); 
+wlog = log(w); 
+hlog = log(h); 
+klog = log(k); 
+ilog = log(i);
+c_r_log = log(c_r);
+c_o_log = log(c_o);
+h_r_log = log(h_r);
+h_o_log = log(h_o);
+dlog = log(s * d / (4 * y));
+proof = 0;
+end;
+                                                                                                                                        options_.solve_tolf = 1e-1;
+
+
+steady;
+resid;
+check;
+
+%% Shocks
+shocks;
+%var va; stderr 10;     
+%var vg; stderr 0.01;    
+%var vm; stderr 0.0025;
+%var vy; stderr 10;
+var vtariff; stderr 3.4;
+%var vtariffsp; stderr 2.5; 
+end;
+
+%% IRFs
+stoch_simul(irf=40,order=1, hp_filter=1600,pruning)
+
+tariff tariffsp y c_o_log c_r_log h_o_log h_r_log pi hindex;
