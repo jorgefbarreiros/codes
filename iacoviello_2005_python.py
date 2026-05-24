@@ -1,133 +1,132 @@
-#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Python translation of the nonlinear Dynare implementation of Iacoviello (2005).
+Iacoviello (2005) in Python
 
-Original Dynare/Matlab workflow represented in the PDFs supplied by the user:
-    1. execute_iacoviello_nonlin.m
-       - calibrates parameters,
-       - computes the steady state,
-       - calls Dynare,
-       - stores selected IRFs.
-    2. iacoviello_2005_base_nonlin.mod
-       - contains the nonlinear equilibrium equations,
-       - initializes the steady state,
-       - runs stoch_simul(order=1, irf=40, ...).
+This script:
+    1. Sets the calibration.
+    2. Computes the analytical steady state used in the Matlab launcher.
+    3. Writes the nonlinear model equations as residuals.
+    4. Numerically linearizes the model around the steady state.
+    5. Solves the first-order rational expectations system using QZ.
+    6. Computes IRFs to the monetary policy shock used in the Dynare file.
+    7. Plots the main IRFs in one orange multipanel figure.
 
-This script is intentionally self-contained. It does not call Matlab or Dynare.
-It implements:
-    - calibration,
-    - analytical steady state from the Matlab launcher,
-    - nonlinear residuals F(x_{t-1}, x_t, E_t x_{t+1}, eps_t) = 0,
-    - numerical linearization around the steady state,
-    - first-order solution via a QZ/generalized-Schur decomposition,
-    - impulse responses to the monetary-policy shock eR.
-
-The first-order system has the form
-
-    A E_t[x_{t+1}] + B x_t + C x_{t-1} + D eps_t = 0.
-
-Given the policy rule x_t = P x_{t-1} + Q eps_t, the deterministic transition
-matrix P is obtained from the stable invariant subspace of the quadratic matrix
-polynomial A P^2 + B P + C = 0. The impact matrix is then
-
-    Q = -(A P + B)^{-1} D.
-
-Dependencies:
-    numpy
-    scipy
-    matplotlib    only needed for plots
-
-Example:
-    python iacoviello_2005_python.py
-    python iacoviello_2005_python.py --horizon 40 --shock-size 1 --save-csv
-    python iacoviello_2005_python.py --shock-size 0.01
-
-Note on shock size:
-    The Dynare file sets var eR = 1 and the Taylor rule contains exp(sR * eR),
-    with sR = 0.29. Therefore shock_size=1 reproduces the same one-standard-
-    deviation normalization used by the supplied .mod file, implying an impact
-    response of lR of approximately 0.29 log points. For smaller illustrative
-    monetary-policy shocks, use e.g. --shock-size 0.01.
+Requirements:
+    pip install numpy scipy matplotlib
 """
 
-from __future__ import annotations
-
-import argparse
-import csv
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
-
 import numpy as np
+import matplotlib.pyplot as plt
 from scipy.linalg import ordqz
 
 
-# Dynare variable ordering from the supplied .mod file.
-VARS: List[str] = [
-    "cp",    # patient-household consumption
-    "rr",    # ex-ante real interest rate
-    "b",     # debt
-    "q",     # real house price
-    "h",     # entrepreneur housing
-    "infl",  # gross inflation
-    "X",     # markup / inverse real marginal-cost object in the model
-    "R",     # gross nominal interest rate
-    "Y",     # output
-    "c",     # entrepreneur consumption
-    "hp",    # patient-household housing
-    "sdf",   # stochastic discount factor used in Calvo block
-    "lam",   # multiplier on borrowing constraint
-    "L",     # labor
-    "vp",    # price dispersion
-    "w",     # real wage
-    "inflp", # reset-price inflation
-    "z1",    # Calvo auxiliary variable
-    "z2",    # Calvo auxiliary variable
-    "lR",    # log nominal rate
-    "lY",    # log output
-    "lpi",   # log inflation
-    "lq",    # log house price
-    "llam",  # log multiplier
+# =============================================================================
+# 0. User options
+# =============================================================================
+
+HORIZON = 40
+
+# Paper / Dynare shock:
+# The .mod file has:
+#     shocks;
+#     var eR = 1;
+#     end;
+SHOCK_SIZE = 1.0
+
+# Plot options
+SAVE_FIGURE = True
+FIGURE_NAME = "iacoviello_2005_irfs_orange.png"
+
+# Set to 100.0 if you want to read log responses approximately as percent.
+PLOT_SCALE = 1.0
+
+ORANGE = "#E67E22"
+
+
+# =============================================================================
+# 1. Variable ordering
+# =============================================================================
+
+VARS = [
+    "cp",      # patient households' consumption
+    "rr",      # ex-ante real interest rate
+    "b",       # debt
+    "q",       # real house price
+    "h",       # entrepreneurs' housing
+    "infl",    # gross inflation
+    "X",       # markup
+    "R",       # gross nominal interest rate
+    "Y",       # output
+    "c",       # entrepreneurs' consumption
+    "hp",      # patient households' housing
+    "sdf",     # stochastic discount factor
+    "lam",     # borrowing constraint multiplier
+    "L",       # labor
+    "vp",      # price dispersion
+    "w",       # real wage
+    "inflp",   # reset-price inflation
+    "z1",      # Calvo auxiliary variable
+    "z2",      # Calvo auxiliary variable
+    "lR",      # log nominal interest rate
+    "lY",      # log output
+    "lpi",     # log inflation
+    "lq",      # log house price
+    "llam",    # log multiplier
 ]
 
-IDX: Dict[str, int] = {name: i for i, name in enumerate(VARS)}
+IDX = {name: i for i, name in enumerate(VARS)}
+
+PLOT_VARS = ["lR", "lY", "lpi", "lq", "llam"]
+
+PANEL_TITLES = {
+    "lR": "Nominal interest rate",
+    "lY": "Output",
+    "lpi": "Inflation",
+    "lq": "House price",
+    "llam": "Borrowing constraint multiplier",
+}
 
 
-@dataclass(frozen=True)
+def get(x, name):
+    """Extract a variable from a vector using its name."""
+    return float(x[IDX[name]])
+
+
+def set_value(x, name, value):
+    """Set a variable in a vector using its name."""
+    x[IDX[name]] = value
+
+
+# =============================================================================
+# 2. Calibration and steady state
+# =============================================================================
+
 class Params:
-    """Model parameters and steady-state objects."""
+    """Model calibration and steady-state objects."""
 
-    beta: float = 0.99
-    gamma: float = 0.98
-    nu: float = 0.03
-    j: float = 0.1
-    m: float = 0.89
-    eta: float = 1.01
-    Xs: float = 1.1
-    theta: float = 0.75
+    def __init__(self):
+        # Preference, technology and financial parameters
+        self.beta = 0.99
+        self.gamma = 0.98
+        self.nu = 0.03
+        self.j = 0.1
+        self.m = 0.89
+        self.eta = 1.01
+        self.Xs = 1.1
+        self.theta = 0.75
 
-    # Taylor rule and shock scaling.
-    rY: float = 0.0
-    rpi: float = 0.27
-    rR: float = 0.73
-    sR: float = 0.29
+        # Taylor rule and monetary policy shock scale
+        self.rY = 0.0
+        self.rpi = 0.27
+        self.rR = 0.73
+        self.sR = 0.29
 
-    @property
-    def gammae(self) -> float:
-        return self.m * self.beta + (1.0 - self.m) * self.gamma
+        # Objects computed exactly as in the Matlab launcher
+        self.gammae = self.m * self.beta + (1.0 - self.m) * self.gamma
+        self.kappa = (1.0 - self.theta) * (1.0 - self.theta * self.beta) / self.theta
 
-    @property
-    def kappa(self) -> float:
-        return (1.0 - self.theta) * (1.0 - self.theta * self.beta) / self.theta
-
-    @property
-    def qhY(self) -> float:
-        return (self.gamma * self.nu / (1.0 - self.gammae)) * (1.0 / self.Xs)
-
-    @property
-    def bY(self) -> float:
-        return (
+        self.qhY = (self.gamma * self.nu / (1.0 - self.gammae)) * (1.0 / self.Xs)
+        self.bY = (
             self.beta
             * self.m
             * self.gamma
@@ -135,223 +134,143 @@ class Params:
             / (1.0 - self.gammae)
             * (1.0 / self.Xs)
         )
-
-    @property
-    def cY(self) -> float:
-        return (
+        self.cY = (
             self.nu
             / self.Xs
             * ((1.0 - self.m * self.beta) * (1.0 - self.gamma) / (1.0 - self.gammae))
         )
+        self.cpY = 1.0 - self.cY
 
-    @property
-    def cpY(self) -> float:
-        return 1.0 - self.cY
+        self.hH = (1.0 + (self.j / (1.0 - self.beta)) * self.cpY / self.qhY) ** (-1.0)
+        self.hpH = 1.0 - self.hH
+        self.hhp = self.hH / self.hpH
+        self.iota = (1.0 - self.beta) * self.hhp
 
-    @property
-    def hH(self) -> float:
-        return (1.0 + (self.j / (1.0 - self.beta)) * self.cpY / self.qhY) ** (-1.0)
+        self.epsi = self.Xs / (self.Xs - 1.0)
+        self.rrb = 1.0 / self.beta
 
-    @property
-    def hpH(self) -> float:
-        return 1.0 - self.hH
+        # Normalizations
+        self.Ys = 1.0
+        self.Hs = 1.0
 
-    @property
-    def hhp(self) -> float:
-        return self.hH / self.hpH
-
-    @property
-    def iota(self) -> float:
-        return (1.0 - self.beta) * self.hhp
-
-    @property
-    def epsi(self) -> float:
-        return self.Xs / (self.Xs - 1.0)
-
-    @property
-    def rrb(self) -> float:
-        return 1.0 / self.beta
-
-    # Normalizations used in the Matlab file.
-    @property
-    def Ys(self) -> float:
-        return 1.0
-
-    @property
-    def Hs(self) -> float:
-        return 1.0
-
-    @property
-    def bs(self) -> float:
-        return self.bY * self.Ys
-
-    @property
-    def cs(self) -> float:
-        return self.cY * self.Ys
-
-    @property
-    def cps(self) -> float:
-        return self.cpY * self.Ys
-
-    @property
-    def hs(self) -> float:
-        return self.hH * self.Hs
-
-    @property
-    def hps(self) -> float:
-        return self.hpH * self.Hs
-
-    @property
-    def Ls(self) -> float:
-        return (((1.0 - self.nu) / self.Xs) / self.cpY) ** (1.0 / self.eta)
-
-    @property
-    def As(self) -> float:
-        return 1.0 / (self.hs**self.nu * self.Ls ** (1.0 - self.nu))
-
-    @property
-    def ws(self) -> float:
-        return ((1.0 - self.nu) / self.Xs) * (self.Ys / self.Ls)
-
-    @property
-    def lams(self) -> float:
-        return self.beta / self.cs - self.gamma / self.cs
-
-    @property
-    def qs(self) -> float:
-        return self.qhY / (self.hs * self.Ys)
+        # Steady-state levels
+        self.bs = self.bY * self.Ys
+        self.cs = self.cY * self.Ys
+        self.cps = self.cpY * self.Ys
+        self.hs = self.hH * self.Hs
+        self.hps = self.hpH * self.Hs
+        self.Ls = (((1.0 - self.nu) / self.Xs) / self.cpY) ** (1.0 / self.eta)
+        self.As = 1.0 / (self.hs ** self.nu * self.Ls ** (1.0 - self.nu))
+        self.ws = ((1.0 - self.nu) / self.Xs) * (self.Ys / self.Ls)
+        self.lams = self.beta / self.cs - self.gamma / self.cs
+        self.qs = self.qhY / (self.hs * self.Ys)
 
 
-@dataclass
-class LinearSolution:
-    """Container for the first-order approximation."""
+def steady_state(p):
+    """Analytical steady state used in the original Matlab/Dynare files."""
 
-    A: np.ndarray
-    B: np.ndarray
-    C: np.ndarray
-    D: np.ndarray
-    P: np.ndarray
-    Q: np.ndarray
-    eigenvalues: np.ndarray
-    n_stable: int
-    steady_state: np.ndarray
+    x = np.zeros(len(VARS))
 
+    set_value(x, "cp", p.cps)
+    set_value(x, "rr", p.rrb)
+    set_value(x, "b", p.bs)
+    set_value(x, "q", p.qs)
+    set_value(x, "h", p.hs)
+    set_value(x, "infl", 1.0)
+    set_value(x, "X", p.Xs)
+    set_value(x, "R", p.rrb)
+    set_value(x, "Y", p.Ys)
+    set_value(x, "c", p.cs)
+    set_value(x, "hp", p.hps)
+    set_value(x, "sdf", p.beta)
+    set_value(x, "lam", p.lams)
+    set_value(x, "L", p.Ls)
+    set_value(x, "vp", 1.0)
+    set_value(x, "w", p.ws)
+    set_value(x, "inflp", 1.0)
+    set_value(x, "z1", (p.Ys / p.Xs) / (1.0 - p.beta * p.theta))
+    set_value(x, "z2", p.Ys / (1.0 - p.beta * p.theta))
 
-def v(x: np.ndarray, name: str) -> float:
-    """Convenience accessor for a named variable."""
-    return float(x[IDX[name]])
+    # Reporting variables
+    set_value(x, "lR", np.log(p.rrb))
+    set_value(x, "lY", np.log(p.Ys))
+    set_value(x, "lpi", 0.0)
+    set_value(x, "lq", np.log(p.qs))
+    set_value(x, "llam", np.log(p.lams))
 
-
-def set_v(x: np.ndarray, name: str, value: float) -> None:
-    """Convenience setter for a named variable."""
-    x[IDX[name]] = value
-
-
-def steady_state(p: Params) -> np.ndarray:
-    """Analytical steady state implied by the supplied Matlab launcher."""
-    x = np.zeros(len(VARS), dtype=float)
-
-    set_v(x, "cp", p.cps)
-    set_v(x, "rr", p.rrb)
-    set_v(x, "b", p.bs)
-    set_v(x, "q", p.qs)
-    set_v(x, "h", p.hs)
-    set_v(x, "infl", 1.0)
-    set_v(x, "X", p.Xs)
-    set_v(x, "R", p.rrb)
-    set_v(x, "Y", p.Ys)
-    set_v(x, "c", p.cs)
-    set_v(x, "hp", p.hps)
-    set_v(x, "sdf", p.beta)
-    set_v(x, "lam", p.lams)
-    set_v(x, "L", p.Ls)
-    set_v(x, "vp", 1.0)
-    set_v(x, "w", p.ws)
-    set_v(x, "inflp", 1.0)
-    set_v(x, "z1", (p.Ys / p.Xs) / (1.0 - p.beta * p.theta))
-    set_v(x, "z2", p.Ys / (1.0 - p.beta * p.theta))
-
-    # Dynare's steady command makes this log(1/beta), even though the initval
-    # block in the supplied .mod file starts lR at zero.
-    set_v(x, "lR", np.log(p.rrb))
-    set_v(x, "lY", np.log(p.Ys))
-    set_v(x, "lpi", 0.0)
-    set_v(x, "lq", np.log(p.qs))
-    set_v(x, "llam", np.log(p.lams))
     return x
 
 
-def residual(
-    x_lag: np.ndarray,
-    x_now: np.ndarray,
-    x_lead: np.ndarray,
-    eR: float,
-    p: Params,
-) -> np.ndarray:
+# =============================================================================
+# 3. Nonlinear equilibrium conditions
+# =============================================================================
+
+def residual(x_lag, x_now, x_lead, eR, p):
     """
-    Nonlinear equilibrium residuals.
+    Nonlinear residuals:
+        F(x_{t-1}, x_t, E_t x_{t+1}, e_t) = 0.
 
-    The equations are written as left-hand side minus right-hand side, matching
-    the ordering of the 24 equations in the supplied Dynare .mod file.
+    The equations follow the order of the Dynare model block.
     """
-    cp = v(x_now, "cp")
-    b = v(x_now, "b")
-    q = v(x_now, "q")
-    h = v(x_now, "h")
-    infl = v(x_now, "infl")
-    X = v(x_now, "X")
-    R = v(x_now, "R")
-    Y = v(x_now, "Y")
-    c = v(x_now, "c")
-    hp = v(x_now, "hp")
-    sdf = v(x_now, "sdf")
-    lam = v(x_now, "lam")
-    L = v(x_now, "L")
-    vp = v(x_now, "vp")
-    w = v(x_now, "w")
-    inflp = v(x_now, "inflp")
-    z1 = v(x_now, "z1")
-    z2 = v(x_now, "z2")
-    rr = v(x_now, "rr")
-    lR = v(x_now, "lR")
-    lY = v(x_now, "lY")
-    lpi = v(x_now, "lpi")
-    lq = v(x_now, "lq")
-    llam = v(x_now, "llam")
 
-    cp_f = v(x_lead, "cp")
-    c_f = v(x_lead, "c")
-    q_f = v(x_lead, "q")
-    L_f = v(x_lead, "L")
-    X_f = v(x_lead, "X")
-    infl_f = v(x_lead, "infl")
-    sdf_f = v(x_lead, "sdf")
-    z1_f = v(x_lead, "z1")
-    z2_f = v(x_lead, "z2")
+    cp = get(x_now, "cp")
+    b = get(x_now, "b")
+    q = get(x_now, "q")
+    h = get(x_now, "h")
+    infl = get(x_now, "infl")
+    X = get(x_now, "X")
+    R = get(x_now, "R")
+    Y = get(x_now, "Y")
+    c = get(x_now, "c")
+    hp = get(x_now, "hp")
+    sdf = get(x_now, "sdf")
+    lam = get(x_now, "lam")
+    L = get(x_now, "L")
+    vp = get(x_now, "vp")
+    w = get(x_now, "w")
+    inflp = get(x_now, "inflp")
+    z1 = get(x_now, "z1")
+    z2 = get(x_now, "z2")
+    rr = get(x_now, "rr")
+    lR = get(x_now, "lR")
+    lY = get(x_now, "lY")
+    lpi = get(x_now, "lpi")
+    lq = get(x_now, "lq")
+    llam = get(x_now, "llam")
 
-    cp_l = v(x_lag, "cp")
-    b_l = v(x_lag, "b")
-    h_l = v(x_lag, "h")
-    infl_l = v(x_lag, "infl")
-    R_l = v(x_lag, "R")
-    Y_l = v(x_lag, "Y")
-    vp_l = v(x_lag, "vp")
+    cp_f = get(x_lead, "cp")
+    c_f = get(x_lead, "c")
+    q_f = get(x_lead, "q")
+    L_f = get(x_lead, "L")
+    X_f = get(x_lead, "X")
+    infl_f = get(x_lead, "infl")
+    sdf_f = get(x_lead, "sdf")
+    z1_f = get(x_lead, "z1")
+    z2_f = get(x_lead, "z2")
 
-    res = np.empty(len(VARS), dtype=float)
+    cp_l = get(x_lag, "cp")
+    b_l = get(x_lag, "b")
+    h_l = get(x_lag, "h")
+    infl_l = get(x_lag, "infl")
+    R_l = get(x_lag, "R")
+    Y_l = get(x_lag, "Y")
+    vp_l = get(x_lag, "vp")
 
-    # (1) Housing Euler equation, patient households.
+    res = np.empty(len(VARS))
+
+    # 1. Patient households' housing Euler equation
     res[0] = q / cp - p.j / hp - p.beta * q_f / cp_f
 
-    # (2) Labor supply, patient households.
+    # 2. Patient households' labor supply
     res[1] = L ** (p.eta - 1.0) - w / cp
 
-    # (3) Bond Euler equation, patient households.
+    # 3. Patient households' bond Euler equation
     res[2] = 1.0 / cp - p.beta * (1.0 / cp_f) * R / infl_f
 
-    # (4) Labor demand.
-    res[3] = (1.0 - p.nu) * p.As * h_l**p.nu * L ** (-p.nu) - X * w
+    # 4. Labor demand
+    res[3] = (1.0 - p.nu) * p.As * h_l ** p.nu * L ** (-p.nu) - X * w
 
-    # (5) Housing Euler equation, entrepreneurs.
+    # 5. Entrepreneurs' housing Euler equation
     res[4] = (
         q / c
         - (p.gamma / c_f)
@@ -359,54 +278,54 @@ def residual(
         - p.m * lam * q_f * infl_f
     )
 
-    # (6) Bond Euler equation, entrepreneurs.
+    # 6. Entrepreneurs' bond Euler equation
     res[5] = 1.0 / c - p.gamma * (1.0 / c_f) * R / infl_f - lam * R
 
-    # (7) Borrowing constraint.
+    # 7. Borrowing constraint
     res[6] = b - p.m * (q_f * h * infl_f / R)
 
-    # (8) Calvo auxiliary z1.
-    res[7] = z1 - Y / X - p.theta * sdf_f * infl_f**p.epsi * z1_f
+    # 8. Calvo auxiliary variable z1
+    res[7] = z1 - Y / X - p.theta * sdf_f * infl_f ** p.epsi * z1_f
 
-    # (9) Calvo auxiliary z2.
+    # 9. Calvo auxiliary variable z2
     res[8] = z2 - Y - p.theta * sdf_f * infl_f ** (p.epsi - 1.0) * z2_f
 
-    # (10) Reset inflation.
+    # 10. Reset-price inflation
     res[9] = inflp - (p.epsi / (p.epsi - 1.0)) * z1 / z2
 
-    # (11) Taylor rule.
+    # 11. Taylor rule
     res[10] = R - (
         p.rrb ** (1.0 - p.rR)
-        * R_l**p.rR
+        * R_l ** p.rR
         * (infl_l ** (1.0 + p.rpi) * (Y_l / p.Ys) ** p.rY) ** (1.0 - p.rR)
         * np.exp(p.sR * eR)
     )
 
-    # (12) Price evolution.
+    # 12. Price evolution
     res[11] = 1.0 - p.theta * infl ** (p.epsi - 1.0) - (1.0 - p.theta) * inflp ** (1.0 - p.epsi)
 
-    # (13) Production function.
-    res[12] = Y * vp - p.As * h_l**p.nu * L ** (1.0 - p.nu)
+    # 13. Production function
+    res[12] = Y * vp - p.As * h_l ** p.nu * L ** (1.0 - p.nu)
 
-    # (14) Price dispersion.
-    res[13] = vp - (1.0 - p.theta) * inflp ** (-p.epsi) - p.theta * infl**p.epsi * vp_l
+    # 14. Price dispersion
+    res[13] = vp - (1.0 - p.theta) * inflp ** (-p.epsi) - p.theta * infl ** p.epsi * vp_l
 
-    # (15) Resource constraint.
+    # 15. Resource constraint
     res[14] = c + cp - Y
 
-    # (16) Housing equilibrium.
+    # 16. Housing market clearing
     res[15] = h + hp - p.Hs
 
-    # (17) Entrepreneur budget constraint.
+    # 17. Entrepreneurs' budget constraint
     res[16] = b - c - q * (h - h_l) - R_l * b_l / infl - w * L + Y * vp / X
 
-    # (18) SDF.
+    # 18. Stochastic discount factor
     res[17] = sdf - p.beta * cp_l / cp
 
-    # (19) Ex-ante real rate.
+    # 19. Ex-ante real interest rate
     res[18] = rr - R / infl_f
 
-    # (20)-(24) Log observables / reporting variables.
+    # 20-24. Reporting variables
     res[19] = lR - np.log(R)
     res[20] = lY - np.log(Y)
     res[21] = lpi - np.log(infl)
@@ -416,27 +335,30 @@ def residual(
     return res
 
 
-def numerical_jacobian(
-    p: Params,
-    x_ss: np.ndarray,
-    step_scale: float = 1e-6,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Central-difference linearization of F(x_{t-1}, x_t, x_{t+1}, e_t).
+# =============================================================================
+# 4. Numerical linearization
+# =============================================================================
 
-    Returns matrices A, B, C, D such that
-        A x_{t+1} + B x_t + C x_{t-1} + D e_t = 0
-    in deviations from the steady state.
+def numerical_jacobian(p, x_ss, step_scale=1e-6):
     """
+    Central-difference numerical derivatives.
+
+    Linearized system:
+        A x_{t+1} + B x_t + C x_{t-1} + D e_t = 0
+
+    where x denotes deviations from steady state.
+    """
+
     n = len(VARS)
-    A = np.zeros((n, n), dtype=float)
-    B = np.zeros((n, n), dtype=float)
-    C = np.zeros((n, n), dtype=float)
-    D = np.zeros((n, 1), dtype=float)
+
+    A = np.zeros((n, n))
+    B = np.zeros((n, n))
+    C = np.zeros((n, n))
+    D = np.zeros((n, 1))
 
     for j in range(n):
         step = step_scale * max(abs(x_ss[j]), 1.0)
-        dx = np.zeros(n, dtype=float)
+        dx = np.zeros(n)
         dx[j] = step
 
         A[:, j] = (
@@ -463,55 +385,60 @@ def numerical_jacobian(
     return A, B, C, D
 
 
-def _stable_selector(alpha: np.ndarray, beta: np.ndarray, stake: float) -> np.ndarray:
-    """Selection rule for stable generalized eigenvalues alpha / beta."""
+# =============================================================================
+# 5. First-order solution using QZ
+# =============================================================================
+
+def stable_selector(alpha, beta, stake):
+    """Select generalized eigenvalues alpha / beta inside the unit circle."""
+
     eig_abs = np.full_like(np.real(alpha), fill_value=np.inf, dtype=float)
     ok = np.abs(beta) > 1e-12
     eig_abs[ok] = np.abs(alpha[ok] / beta[ok])
+
     return eig_abs < stake
 
 
-def solve_first_order_qz(
-    A: np.ndarray,
-    B: np.ndarray,
-    C: np.ndarray,
-    D: np.ndarray,
-    x_ss: np.ndarray,
-    stake: float = 1.0 - 1e-8,
-) -> LinearSolution:
+def solve_first_order_qz(A, B, C, D, x_ss, stake=1.0 - 1e-8):
     """
-    Solve the linearized rational-expectations system with a QZ decomposition.
+    Solve:
+        A E_t[x_{t+1}] + B x_t + C x_{t-1} + D e_t = 0
 
-    For the second-order expectational difference system
-        A E_t[x_{t+1}] + B x_t + C x_{t-1} + D eps_t = 0,
-    form the companion pencil
-        G0 z_{t+1} = G1 z_t,
-    with z_t = [x_t', x_{t-1}']'. The stable invariant subspace gives
-        x_t = P x_{t-1}.
+    Decision rule:
+        x_t = P x_{t-1} + Q e_t
     """
+
     n = A.shape[0]
-    zeros = np.zeros((n, n), dtype=float)
+
+    zeros = np.zeros((n, n))
     eye = np.eye(n)
 
-    G0 = np.block([[A, zeros], [zeros, eye]])
-    G1 = np.block([[-B, -C], [eye, zeros]])
+    G0 = np.block([
+        [A, zeros],
+        [zeros, eye]
+    ])
 
-    def sort_fun(alpha: np.ndarray, beta: np.ndarray) -> np.ndarray:
-        return _stable_selector(alpha, beta, stake=stake)
+    G1 = np.block([
+        [-B, -C],
+        [eye, zeros]
+    ])
 
-    # ordqz solves G1 v = lambda G0 v when called as ordqz(G1, G0).
+    def sort_fun(alpha, beta):
+        return stable_selector(alpha, beta, stake)
+
+    # Generalized Schur decomposition
     _, _, alpha, beta, _, Z = ordqz(G1, G0, sort=sort_fun, output="complex")
 
     eig = np.full(alpha.shape, np.inf + 0j, dtype=complex)
     ok = np.abs(beta) > 1e-12
     eig[ok] = alpha[ok] / beta[ok]
+
     n_stable = int(np.sum(np.abs(eig) < stake))
 
     if n_stable != n:
         raise RuntimeError(
-            f"QZ solution did not find exactly n={n} stable roots. "
-            f"Found {n_stable}. The Blanchard-Kahn count is not satisfied "
-            "under the current ordering/tolerance."
+            "QZ did not find exactly n stable roots. "
+            f"Required: {n}; found: {n_stable}."
         )
 
     Z_stable = Z[:, :n]
@@ -519,165 +446,163 @@ def solve_first_order_qz(
     Z_bottom = Z_stable[n:, :]
 
     if np.linalg.cond(Z_bottom) > 1e12:
-        raise RuntimeError(
-            "The stable invariant subspace is nearly singular. "
-            "Try changing the QZ tolerance or inspecting the model timing."
-        )
+        raise RuntimeError("The stable subspace is close to singular.")
 
     P = Z_top @ np.linalg.inv(Z_bottom)
-    P = np.real_if_close(P, tol=1_000).real
+    P = np.real_if_close(P, tol=1000).real
 
-    AP_plus_B = A @ P + B
-    Q = -np.linalg.solve(AP_plus_B, D)
-    Q = np.real_if_close(Q, tol=1_000).real
+    Q = -np.linalg.solve(A @ P + B, D)
+    Q = np.real_if_close(Q, tol=1000).real
 
-    return LinearSolution(A=A, B=B, C=C, D=D, P=P, Q=Q, eigenvalues=eig, n_stable=n_stable, steady_state=x_ss)
+    return P, Q, eig, n_stable
 
 
-def solve_model(p: Params, step_scale: float = 1e-6) -> LinearSolution:
-    """Convenience wrapper: steady state, linearization, QZ solution."""
+def solve_model(p):
+    """Compute steady state, linearize and solve the model."""
+
     x_ss = steady_state(p)
-    max_ss_resid = np.max(np.abs(residual(x_ss, x_ss, x_ss, 0.0, p)))
+
+    ss_resid = residual(x_ss, x_ss, x_ss, 0.0, p)
+    max_ss_resid = np.max(np.abs(ss_resid))
+
     if max_ss_resid > 1e-7:
-        raise RuntimeError(f"Steady state residuals are too large: {max_ss_resid:.3e}")
+        raise RuntimeError(f"Steady-state residuals are too large: {max_ss_resid:.3e}")
 
-    A, B, C, D = numerical_jacobian(p, x_ss, step_scale=step_scale)
-    return solve_first_order_qz(A, B, C, D, x_ss)
+    A, B, C, D = numerical_jacobian(p, x_ss)
+
+    P, Q, eig, n_stable = solve_first_order_qz(A, B, C, D, x_ss)
+
+    return {
+        "x_ss": x_ss,
+        "A": A,
+        "B": B,
+        "C": C,
+        "D": D,
+        "P": P,
+        "Q": Q,
+        "eig": eig,
+        "n_stable": n_stable,
+    }
 
 
-def impulse_response(
-    sol: LinearSolution,
-    horizon: int = 40,
-    shock_size: float = 1.0,
-) -> np.ndarray:
+# =============================================================================
+# 6. Impulse response functions
+# =============================================================================
+
+def impulse_response(solution, horizon=40, shock_size=1.0):
     """
-    Generate IRFs in deviations from steady state.
+    Compute IRFs in deviations from steady state.
 
-    For shock_size=1, this matches the Dynare normalization var eR = 1.
+    Decision rule:
+        x_t = P x_{t-1} + Q e_t
     """
+
+    P = solution["P"]
+    Q = solution["Q"]
+
     n = len(VARS)
-    irf = np.zeros((horizon, n), dtype=float)
-    irf[0, :] = (sol.Q[:, 0] * shock_size)
+    irf = np.zeros((horizon, n))
+
+    irf[0, :] = Q[:, 0] * shock_size
+
     for t in range(1, horizon):
-        irf[t, :] = sol.P @ irf[t - 1, :]
+        irf[t, :] = P @ irf[t - 1, :]
+
     return irf
 
 
-def print_steady_state(p: Params, x_ss: np.ndarray) -> None:
-    """Print a compact steady-state table."""
-    print("\nSteady state")
-    print("------------")
-    for name in VARS:
-        print(f"{name:>6s}: {x_ss[IDX[name]]: .10f}")
+# =============================================================================
+# 7. Plotting
+# =============================================================================
 
-
-def print_solution_diagnostics(sol: LinearSolution) -> None:
-    """Print basic diagnostics for the first-order solution."""
-    eig_abs = np.abs(sol.eigenvalues)
-    finite = np.isfinite(eig_abs)
-    print("\nSolution diagnostics")
-    print("--------------------")
-    print(f"Stable roots selected: {sol.n_stable} out of {len(VARS)} required")
-    print(f"Max |steady-state residual|: {np.max(np.abs(residual(sol.steady_state, sol.steady_state, sol.steady_state, 0.0, Params()))):.3e}")
-    if np.any(finite):
-        print(f"Largest finite |generalized eigenvalue|: {np.max(eig_abs[finite]):.6g}")
-    quad_err = sol.A @ sol.P @ sol.P + sol.B @ sol.P + sol.C
-    print(f"Max |A P^2 + B P + C|: {np.max(np.abs(quad_err)):.3e}")
-
-
-def save_irfs_csv(irf: np.ndarray, output_path: Path) -> None:
-    """Save IRFs as a CSV file in raw deviations from steady state."""
-    with output_path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(["period", *VARS])
-        for t in range(irf.shape[0]):
-            writer.writerow([t, *irf[t, :]])
-    print(f"\nSaved IRFs to: {output_path}")
-
-
-def plot_irfs(irf: np.ndarray, variables: Iterable[str], scale: float = 1.0) -> None:
-    """Plot selected IRFs, one figure per variable."""
-    import matplotlib.pyplot as plt
+def plot_irfs(irf, variables, scale=1.0):
+    """Plot selected IRFs in one orange multipanel figure."""
 
     periods = np.arange(irf.shape[0])
-    for name in variables:
-        if name not in IDX:
-            raise ValueError(f"Unknown variable {name!r}. Valid names are: {', '.join(VARS)}")
-        plt.figure()
-        plt.axhline(0.0, linewidth=0.8)
-        plt.plot(periods, scale * irf[:, IDX[name]], linewidth=2.0)
-        plt.title(f"IRF: {name}")
-        plt.xlabel("Periods")
-        plt.ylabel("Deviation from steady state" if scale == 1.0 else f"Deviation × {scale:g}")
-        plt.tight_layout()
+
+    n_vars = len(variables)
+    ncols = 3
+    nrows = int(np.ceil(n_vars / ncols))
+
+    fig, axes = plt.subplots(
+        nrows=nrows,
+        ncols=ncols,
+        figsize=(14, 7),
+        squeeze=False
+    )
+
+    axes_flat = axes.ravel()
+
+    for ax, var in zip(axes_flat, variables):
+        ax.axhline(0.0, color="black", linewidth=0.8, alpha=0.45)
+
+        ax.plot(
+            periods,
+            scale * irf[:, IDX[var]],
+            color=ORANGE,
+            linewidth=2.5
+        )
+
+        ax.set_title(PANEL_TITLES[var], fontsize=12)
+        ax.set_xlabel("Periods")
+        ax.set_ylabel("Response")
+        ax.grid(True, alpha=0.25)
+
+    # Hide unused panels
+    for ax in axes_flat[n_vars:]:
+        ax.axis("off")
+
+    fig.suptitle(
+        "Iacoviello (2005): IRFs to a Monetary Policy Shock",
+        fontsize=15,
+        y=0.98
+    )
+
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.94))
+
+    if SAVE_FIGURE:
+        fig.savefig(FIGURE_NAME, dpi=300, bbox_inches="tight")
+
     plt.show()
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="First-order Python solution of the supplied Iacoviello (2005) Dynare model."
-    )
-    parser.add_argument("--horizon", type=int, default=40, help="IRF horizon. Default: 40.")
-    parser.add_argument(
-        "--shock-size",
-        type=float,
-        default=1.0,
-        help="Size of eR shock. Default: 1, matching Dynare var eR=1.",
-    )
-    parser.add_argument(
-        "--plot-vars",
-        nargs="+",
-        default=["lR", "lY", "lpi", "lq", "llam"],
-        help="Variables to plot. Default: lR lY lpi lq llam.",
-    )
-    parser.add_argument(
-        "--plot-scale",
-        type=float,
-        default=1.0,
-        help="Multiply plotted IRFs by this number. Raw CSV is unaffected. Default: 1.",
-    )
-    parser.add_argument(
-        "--no-plots",
-        action="store_true",
-        help="Run computations without displaying plots.",
-    )
-    parser.add_argument(
-        "--save-csv",
-        action="store_true",
-        help="Save raw IRFs to irfs_iacoviello_2005.csv.",
-    )
-    parser.add_argument(
-        "--csv-path",
-        type=Path,
-        default=Path("irfs_iacoviello_2005.csv"),
-        help="Output path for CSV if --save-csv is used.",
-    )
-    parser.add_argument(
-        "--print-steady-state",
-        action="store_true",
-        help="Print the full steady-state vector.",
-    )
-    args = parser.parse_args()
+# =============================================================================
+# 8. Run
+# =============================================================================
 
-    p = Params()
-    sol = solve_model(p)
-    irf = impulse_response(sol, horizon=args.horizon, shock_size=args.shock_size)
+p = Params()
+solution = solve_model(p)
 
-    print_solution_diagnostics(sol)
-    if args.print_steady_state:
-        print_steady_state(p, sol.steady_state)
+irf = impulse_response(
+    solution,
+    horizon=HORIZON,
+    shock_size=SHOCK_SIZE
+)
 
-    print("\nSelected impact responses, period 0")
-    print("-----------------------------------")
-    for name in args.plot_vars:
-        print(f"{name:>6s}: {irf[0, IDX[name]]: .10f}")
+# Diagnostics
+x_ss = solution["x_ss"]
+A = solution["A"]
+B = solution["B"]
+C = solution["C"]
+P = solution["P"]
+eig = solution["eig"]
 
-    if args.save_csv:
-        save_irfs_csv(irf, args.csv_path)
+ss_resid = residual(x_ss, x_ss, x_ss, 0.0, p)
+quad_err = A @ P @ P + B @ P + C
 
-    if not args.no_plots:
-        plot_irfs(irf, args.plot_vars, scale=args.plot_scale)
+print("Iacoviello (2005) Python solution")
+print("---------------------------------")
+print(f"Stable roots selected: {solution['n_stable']} out of {len(VARS)} required")
+print(f"Maximum steady-state residual: {np.max(np.abs(ss_resid)):.3e}")
+print(f"Maximum |A P^2 + B P + C|: {np.max(np.abs(quad_err)):.3e}")
+print("")
+print("Impact responses, period 0")
+print("--------------------------")
+for var in PLOT_VARS:
+    print(f"{PANEL_TITLES[var]:35s}: {irf[0, IDX[var]]: .10f}")
 
-
-if __name__ == "__main__":
-    main()
+plot_irfs(
+    irf=irf,
+    variables=PLOT_VARS,
+    scale=PLOT_SCALE
+)
